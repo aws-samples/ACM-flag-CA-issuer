@@ -1,0 +1,233 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  MatchLogic:
+    Type: String
+    Default: "exact"
+    AllowedValues:
+      - "exact"
+      - "regex"
+  FlagIndicator:
+    Type: String
+    Description: >
+      If resource that meet MatchLogic/vales are COMPLIANT or NOT_COMPLIANT.
+    Default: NON_COMPLIANT
+    AllowedValues:
+      - NON_COMPLIANT
+      - COMPLIANT
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+  LambdaRolePolicy:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: Wildcard resource required for ACM and config API actions
+          - id: W91
+            reason: Access to CWL is granted, cdn_nag not detecting
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+              - "acm:ListCertificates"
+              - "acm:DescribeCertificate"
+              - "config:PutEvaluations"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - "ssm:GetParameter"
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${FlaggedCAListParameter}"
+      Roles:
+        - !Ref LambdaRole
+
+  FlaggedCAListParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: flagged-ca-list
+      Type: StringList
+      Value: !Join
+        - ","
+        -
+          - Entrust Root Certification Authority
+          - AffirmTrust Commercial
+          - AffirmTrust Networking
+          - AffirmTrust Premium
+          - AffirmTrust Premium ECC
+          - Entrust Root Certification Authority
+          - Entrust Root Certification Authority - EC1
+          - Entrust Root Certification Authority - G2
+          - Entrust Root Certification Authority - G4
+          - Entrust.net Certification Authority (2048)
+      Description: List of Flagged CAs
+
+  ConfigPermissionToCallLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::GetAtt:
+          - ConfigRuleLambdaFunction
+          - Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "config.amazonaws.com"
+      SourceAccount: !Ref 'AWS::AccountId'
+  ConfigRuleLambdaFunction:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: Access to CWL is granted, cdn_nag not detecting
+          - id: W89
+            reason: Not relevant for use case
+          - id: W92
+            reason: Not relevant for use case
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import re
+          import os
+          import botocore
+          from datetime import datetime
+
+          config_client = boto3.client('config')
+          acm_client = boto3.client('acm')
+          ssm_client = boto3.client('ssm')
+          MATCH_LOGIC = os.environ.get('MatchLogic', 'exact')
+          FLAG_INDICATOR = os.environ.get('FlagIndicator', 'NON_COMPLIANT')
+          FLAGGED_CA_LIST = ssm_client.get_parameter(Name='flagged-ca-list').get('Parameter').get('Value').split(',')
+
+          if FLAG_INDICATOR == 'NON_COMPLIANT':
+              DEFAULT_RESULT_CONFIG = 'COMPLIANT'
+          else:
+              DEFAULT_RESULT_CONFIG = 'NOT_COMPLIANT'
+          # Define the default Config result.
+          #DEFAULT_RESULT_CONFIG = 'COMPLIANT'
+          #DEFAULT_RESULT_CONFIG = 'NOT_COMPLIANT'
+          #DEFAULT_RESULT_CONFIG = 'NOT_APPLICABLE'
+
+          class ConfigResult():
+              ### Define and send AWS Config resource compliance
+              def __init__(self):
+                  self.client = boto3.client('config')
+                  self.config_result = DEFAULT_RESULT_CONFIG
+                  self._annotation = []
+                  self.resource_type = None
+                  self.resource_id = None
+                  self.result_token = None
+
+              def annotation(self, value:str = None):
+                  """Append a value to the eventual annotation string"""
+                  self._annotation.append(value)
+
+              def _build(self):
+                  """ Set default or construct annotation String """
+                  if self._annotation == []:
+                      self.annotation_value = ' '
+                  else:
+                      self.annotation_value =  ' | '.join(self._annotation)
+
+              def configure(self, event:dict = None):
+                  """Extract details from AWS Config > Lambda event to send compliance later."""
+                  invoking_event = json.loads(event.get('invokingEvent',"{}"))
+                  configuration_item = invoking_event.get('configurationItem')
+                  self.resource_type = configuration_item.get('resourceType', None)
+                  self.resource_id = configuration_item.get('resourceId', None)
+                  self.result_token = event.get('resultToken', None)
+
+              def send(self):
+                  """Respond to AWS Config with Resource Results."""
+                  self._build()
+                  print(f"Sending config result:  {self.resource_id} | {self.config_result} | {self.annotation_value}")
+                  if self.config_result in ['COMPLIANT','NOT_COMPLIANT']:
+                          self.client.put_evaluations(
+                                  Evaluations=[
+                                      {
+                                          'ComplianceResourceType': self.resource_type,
+                                          'ComplianceResourceId': self.resource_id,
+                                          'ComplianceType': self.config_result,
+                                          'Annotation': self.annotation_value,
+                                          'OrderingTimestamp': datetime.now()
+                                      },
+                                  ],
+                                  ResultToken=self.result_token
+                              )    
+
+          def lambda_handler(event, context):
+              ### Identify ACM Certificates Issued by specific CAs###
+              config_result = ConfigResult()
+              config_result.configure(event)
+              invoking_event = json.loads(event.get('invokingEvent',"{}"))
+              configuration_item = invoking_event.get('configurationItem')
+              certificate_issuer = configuration_item.get('configuration').get('issuer')
+              if configuration_item.get('configurationItemStatus', None) in ['ResourceDeleted', None]:
+                  config_result.config_result = 'NOT_APPLICABLE'
+                  return
+              else:
+                  match MATCH_LOGIC:
+                    case 'exact':
+                      if certificate_issuer in FLAGGED_CA_LIST:
+                          config_result.config_result = FLAG_INDICATOR
+                          config_result.annotation(f"Certificate issues by  {certificate_issuer}")
+                    case 'regex':
+                      for flagged_ca_pattern in FLAGGED_CA_LIST:
+                          if re.match(flagged_ca_pattern, certificate_issuer):
+                              print(f"regex match: {flagged_ca_pattern} || {certificate_issuer}")
+                              config_result.config_result = FLAG_INDICATOR
+                              config_result.annotation(f"Certificate issues by  {certificate_issuer}")
+              config_result.send()
+
+      Handler: "index.lambda_handler"
+      Runtime: python3.12
+      Timeout: 15
+      Environment:
+        Variables:
+          MatchLogic: !Ref MatchLogic
+          FlagIndicator: !Ref FlagIndicator
+      Role: !GetAtt LambdaRole.Arn
+
+  ConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: flagged_ca_check
+      Description: Evaluate if certificates were issued by a list of provided CAs (via SSM Parameter).
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::ACM::Certificate"
+      Source:
+        Owner: "CUSTOM_LAMBDA"
+        SourceDetails:
+          -
+            EventSource: "aws.config"
+            MessageType: "ConfigurationItemChangeNotification"
+          -
+            EventSource: aws.config
+            MessageType: OversizedConfigurationItemChangeNotification
+        SourceIdentifier:
+          Fn::GetAtt:
+            - ConfigRuleLambdaFunction
+            - Arn
+    DependsOn: ConfigPermissionToCallLambda
