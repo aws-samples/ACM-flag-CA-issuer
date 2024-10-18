@@ -6,6 +6,8 @@ Three solutions/approaches allow you to audit the Issuer of certificates stored 
 * You have an allowed/preferred list of Certificate Authorities and need to audit this across your Organization
 * You have a list of Certificate Authorities you do NOT to be used or need to flag where they are being used
   * This could be company policy or as a result of a upcoming client/browser trusted CA store change to identify impact/risk.
+ 
+Please see this [AWS Security Blog post](https://aws.amazon.com/blogs/security/options-for-aws-customers-who-use-entrust-issued-certificates/) for more information about how to use this project, and why it might be useful for you.
 
 ## Approaches
 
